@@ -28,6 +28,222 @@ PLAN.md         phase plan, decisions and known weaknesses
 notes.md        original requirements and rules
 ```
 
+## User flows
+
+**Customer**
+1. `get_quote(pickup, dropoff)`: returns the fare, surge, trip ETA and an expiry 120 s away. The quote is single-use.
+2. `request_ride(quote, pooled=False)`: books a ride. Only one active ride is allowed per customer.
+3. `ride_status(ride)`: shows where the ride stands. An offer that has gone unanswered for 30 s is passed to the next driver here.
+4. `pickup_eta(ride)`: how long until the driver arrives. For a pooled ride this follows the pool route.
+5. `cancel(ride)`: free at any time before completion.
+6. `rate(ride, 1..5)`: once, after completion.
+7. `payment_status(ride)` / `retry_payment(ride)`.
+
+**Driver**
+1. Register, go online or offline, and update location.
+2. `accept(ride)` or `reject(ride)` an offer. A rejected ride goes to the next-ranked driver.
+3. `start(ride)` at pickup, then `complete(ride)` at drop-off. Completing a ride triggers the payment.
+
+## UML diagrams
+
+### Component / class diagram
+```mermaid
+classDiagram
+    direction LR
+    class RideService {
+        +get_quote(caller, pickup, dropoff) Quote
+        +request_ride(caller, quote, pooled) str
+        +accept(caller, ride_id)
+        +reject(caller, ride_id)
+        +start(caller, ride_id)
+        +complete(caller, ride_id) PaymentStatus
+        +cancel(caller, ride_id)
+        +rate(caller, ride_id, stars)
+        +ride_status(caller, ride_id) RideStatus
+        +pickup_eta(caller, ride_id) int
+        +retry_payment(caller, ride_id) PaymentStatus
+    }
+    class DriverRegistry {
+        +register(caller, driver)
+        +update_location(caller, id, point)
+        +try_claim(caller, id) bool
+        +release(caller, id)
+        +snapshot(caller) DriverView[]
+    }
+    class RideRegistry {
+        +add(caller, ride)
+        +apply(ride_id, action)
+    }
+    class NearestDriverFinder {
+        +find(views, pickup, exclude) Candidate[]
+    }
+    class DriverRanker {
+        +rank(candidates) RankedDriver[]
+    }
+    class PoolMatcher {
+        +try_join(caller, driver_id, rider, start) bool
+        +leave(caller, driver_id, rider_id) bool
+        +mark_onboard(caller, driver_id, rider_id, start)
+    }
+    class RoutePlanner {
+        +plan(start, riders) Route
+    }
+    class Quoter {
+        +quote(caller, pickup, dropoff, supply) Quote
+        +is_valid(caller, quote) bool
+    }
+    class SurgeCalculator {
+        +surge_bps(zone, supply) int
+    }
+    class PaymentService {
+        +pay(caller, ride_id, amount) PaymentStatus
+    }
+    class PaymentGateway {
+        <<interface>>
+        +charge(key, amount) bool
+    }
+    class Ride {
+        id
+        status: RideStatus
+        driver_id
+        fare_paise
+        pooled
+    }
+    class Driver {
+        id
+        location: Point
+        status: DriverStatus
+        seats
+    }
+    RideService --> DriverRegistry
+    RideService --> RideRegistry
+    RideService --> NearestDriverFinder
+    RideService --> DriverRanker
+    RideService --> PoolMatcher
+    RideService --> Quoter
+    RideService --> DemandTracker
+    RideService --> EtaPredictor
+    RideService --> PaymentService
+    PoolMatcher --> RoutePlanner
+    Quoter --> FareCalculator
+    Quoter --> SurgeCalculator
+    Quoter --> EtaPredictor
+    SurgeCalculator --> DemandTracker
+    SurgeCalculator --> DemandForecaster
+    SurgeCalculator --> TimeOfDayFactor
+    DemandForecaster --> DemandTracker
+    EtaPredictor --> TimeOfDayFactor
+    PaymentService --> PaymentGateway
+    PaymentGateway <|.. FakeGateway
+    DriverRegistry "1" o-- "*" Driver
+    DriverRegistry "1" o-- "*" DriverStats
+    RideRegistry "1" o-- "*" Ride
+```
+
+### Ride state machine
+```mermaid
+stateDiagram-v2
+    [*] --> REQUESTED: request_ride
+    REQUESTED --> OFFERED: dispatch offers best driver
+    REQUESTED --> NO_DRIVER_FOUND: no candidate left
+    OFFERED --> ACCEPTED: driver accepts
+    OFFERED --> REQUESTED: driver rejects or 30s timeout
+    ACCEPTED --> IN_PROGRESS: driver starts
+    IN_PROGRESS --> COMPLETED: driver completes
+    REQUESTED --> CANCELLED: customer cancels
+    OFFERED --> CANCELLED: customer cancels
+    ACCEPTED --> CANCELLED: customer cancels
+    IN_PROGRESS --> CANCELLED: customer cancels
+    COMPLETED --> [*]
+    CANCELLED --> [*]
+    NO_DRIVER_FOUND --> [*]
+```
+
+### Driver state machine
+```mermaid
+stateDiagram-v2
+    [*] --> OFFLINE: register
+    OFFLINE --> AVAILABLE: go_online
+    AVAILABLE --> OFFLINE: go_offline
+    AVAILABLE --> RESERVED: try_claim for an offer
+    RESERVED --> AVAILABLE: reject, timeout or cancel
+    RESERVED --> BUSY: accept
+    BUSY --> AVAILABLE: complete or cancel, last pool rider gone
+```
+
+### Payment state machine
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING
+    PENDING --> PROCESSING: complete
+    PROCESSING --> PAID: gateway ok within 3 tries
+    PROCESSING --> PAYMENT_FAILED: 3 failed tries
+    PAYMENT_FAILED --> PROCESSING: retry_payment
+    PAID --> [*]
+```
+
+### Sequence: quote, book, ride, pay (solo)
+```mermaid
+sequenceDiagram
+    actor C as Customer
+    actor D as Driver
+    participant S as RideService
+    participant DR as DriverRegistry
+    participant M as Finder + Ranker
+    participant Q as Quoter
+    participant P as PaymentService
+    participant G as Gateway
+
+    C->>S: get_quote(pickup, dropoff)
+    S->>DR: snapshot (count supply in zone)
+    S->>Q: quote(supply)
+    Q-->>C: Quote(fare, surge, ETA, expires in 120s)
+    C->>S: request_ride(quote)
+    Note over S: customer lock: one active ride, quote unused
+    S->>S: record demand for surge
+    S->>DR: snapshot
+    S->>M: find within radius, rank by performance, rating, proximity
+    S->>DR: try_claim(best driver)
+    DR-->>S: claimed, driver RESERVED
+    Note over S: ride lock: ride OFFERED
+    D->>S: accept(ride)
+    Note over S: ride lock then driver lock: ACCEPTED, driver BUSY
+    D->>S: start(ride)
+    D->>S: complete(ride)
+    Note over S: driver AVAILABLE, stats and trip time recorded
+    S->>P: pay(ride, fare)
+    loop up to 3 attempts, no locks held
+        P->>G: charge(pay-ride_id, amount)
+    end
+    P-->>D: PAID or PAYMENT_FAILED
+    C->>S: rate(ride, stars)
+```
+
+### Sequence: pooled ride
+```mermaid
+sequenceDiagram
+    actor C1 as Customer 1
+    actor C2 as Customer 2
+    actor D as Driver
+    participant S as RideService
+    participant PM as PoolMatcher
+    participant RP as RoutePlanner
+
+    C1->>S: request_ride(quote, pooled=True)
+    S->>D: offer (no open pool, normal dispatch)
+    D->>S: accept
+    S->>PM: open_pool(driver, seats capped at 4) and join C1
+    C2->>S: request_ride(quote, pooled=True)
+    S->>PM: try_join(nearest open pool)
+    PM->>RP: plan all stop orders, pickup before drop
+    RP-->>PM: shortest route where everyone is within 1.5x of a solo trip
+    PM-->>S: joined
+    S->>D: offer C2 (driver already BUSY)
+    D->>S: accept, start, complete for each rider
+    S->>PM: leave(rider) and replan
+    Note over S,PM: driver released only when the last rider leaves
+```
+
 ## Modules
 
 ### `core.py`: building blocks
